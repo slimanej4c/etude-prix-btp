@@ -1,0 +1,7 @@
+PySide6
+pandas
+openpyxl
+pytest
+rapidfuzz
+matplotlib
+sentence-transformers

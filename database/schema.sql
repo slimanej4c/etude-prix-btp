@@ -1,0 +1,2 @@
+-- Le schéma initial sera géré via la migration 001_schema_initial.sql
+-- Ce fichier peut servir de référence complète du schéma si besoin, mais n'est pas exécuté directement dans cette implémentation.
