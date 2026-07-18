@@ -8,7 +8,7 @@ import pytest
 from openpyxl import Workbook
 from PySide6.QtCore import QEventLoop, QItemSelectionModel, QThread, QTimer, Qt
 from PySide6.QtGui import QColor
-from PySide6.QtWidgets import QApplication, QMessageBox, QPushButton, QHeaderView, QRadioButton
+from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QPushButton, QHeaderView, QRadioButton
 
 from database.db_manager import DatabaseManager
 from models.entites import Bibliotheque, OuvrageBibliotheque, Projet, SectionProjet
@@ -32,6 +32,7 @@ from ui.pages.projets_page import (
     DpgfImportWorker,
     MappingPageDialog,
     MatchingWorker,
+    ProposalSelectionDialog,
     ProjetsPage,
     QuickOuvrageCreateDialog,
 )
@@ -376,14 +377,17 @@ def test_page_dpgf_valider_et_annuler_validation(qapp, temp_db_manager, projet_i
     page.tree.setCurrentItem(page.tree.topLevelItem(0))
     page.view_mode_combo.setCurrentText("Tous les ouvrages descendants")
 
-    labels_seen = []
-    monkeypatch.setattr(
-        "ui.pages.projets_page.QInputDialog.getItem",
-        lambda *args, **kwargs: (labels_seen.append(args[3][0]) or args[3][0], True),
-    )
+    selected_ids = []
+
+    def fake_exec(dialog):
+        selected_ids.append(dialog.table.item(0, 1).text())
+        dialog.selected_correspondance_id = ids["corr_a"]
+        return QDialog.Accepted
+
+    monkeypatch.setattr("ui.pages.projets_page.ProposalSelectionDialog.exec", fake_exec)
     page.valider_proposition_dpgf(ids["section_a"])
 
-    assert labels_seen and "CL-A" in labels_seen[0]
+    assert selected_ids == ["CL-A"]
     assert service.statut_ouvrage(ids["section_a"]) == "Validée"
     buttons = page.children_table.cellWidget(0, 10).findChildren(QPushButton)
     assert [button.text() for button in buttons] == ["Annuler", "..."]
@@ -393,6 +397,17 @@ def test_page_dpgf_valider_et_annuler_validation(qapp, temp_db_manager, projet_i
     assert service.statut_ouvrage(ids["section_a"]) == "Proposée"
     buttons = page.children_table.cellWidget(0, 10).findChildren(QPushButton)
     assert [button.text() for button in buttons] == ["Valider", "..."]
+
+
+def test_fenetre_propositions_large_et_lisible(qapp, temp_db_manager, projet_id):
+    _projet, _sections, service, ids = build_mapping_fixture(temp_db_manager, projet_id)
+    propositions = service.correspondances_pour_ouvrage(ids["section_a"])
+
+    dialog = ProposalSelectionDialog(propositions)
+
+    assert dialog.minimumWidth() >= 900
+    assert dialog.table.horizontalHeader().sectionResizeMode(2) == QHeaderView.Stretch
+    assert dialog.table.item(0, 2).text()
 
 
 def test_mapping_page_affiche_toutes_lignes_et_propositions(qapp, temp_db_manager, projet_id):
@@ -595,6 +610,26 @@ def test_table_mapping_chiffrage_designation_redimensionnable(qapp, temp_db_mana
     header = dialog.table.horizontalHeader()
     assert header.sectionResizeMode(1) == QHeaderView.Interactive
     assert dialog.table.columnWidth(1) >= 300
+
+
+def test_table_mapping_chiffrage_liste_propositions_elargie(qapp, temp_db_manager, projet_id):
+    projet, _sections, service, ids = build_mapping_fixture(temp_db_manager, projet_id)
+    chiffrage = ChiffrageProjetService(
+        temp_db_manager,
+        SectionProjetRepository(temp_db_manager),
+        CorrespondanceDpgfRepository(temp_db_manager),
+    )
+    dialog = ChiffrageTableDialog(
+        projet,
+        chiffrage,
+        correspondance_service=service,
+        db_manager=temp_db_manager,
+    )
+    ouvrage = next(row for row in dialog.rows if row["section_id"] == ids["section_a"])
+    table_row = dialog.row_by_ouvrage_id[ouvrage["id"]]
+    combo = dialog.table.cellWidget(table_row, dialog.mapping_col_proposals)
+
+    assert combo.view().minimumWidth() >= 900
 
 
 def test_page_mapping_chiffrage_sauvegarde_travail_en_version(qapp, temp_db_manager, projet_id, monkeypatch):

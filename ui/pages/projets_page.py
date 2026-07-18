@@ -314,6 +314,67 @@ class CatalogueSearchDialog(QDialog):
         super().accept()
 
 
+class ProposalSelectionDialog(QDialog):
+    def __init__(self, propositions, parent=None):
+        super().__init__(parent)
+        self.propositions = propositions
+        self.selected_correspondance_id = None
+        self.setWindowTitle("Valider une proposition")
+        self.resize(1050, 560)
+        self.setMinimumSize(900, 420)
+        self.setStyleSheet(APP_STYLESHEET)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Proposition à valider :"))
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["Score", "Code", "Désignation", "Bibliothèque"])
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setWordWrap(True)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setSectionResizeMode(2, QHeaderView.Stretch)
+        self.table.setColumnWidth(0, 80)
+        self.table.setColumnWidth(1, 140)
+        self.table.setColumnWidth(3, 220)
+        layout.addWidget(self.table, 1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.populate()
+
+    def populate(self):
+        self.table.setRowCount(len(self.propositions))
+        for row, proposition in enumerate(self.propositions):
+            values = [
+                f"{float(proposition['score']):.1f}",
+                proposition["code"] or "",
+                proposition["designation"] or "",
+                proposition["bibliotheque_nom"] or "",
+            ]
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setData(Qt.UserRole, proposition["id"])
+                item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                self.table.setItem(row, col, item)
+        if self.propositions:
+            self.table.selectRow(0)
+        self.table.resizeRowsToContents()
+
+    def accept(self):
+        current_row = self.table.currentRow()
+        if current_row < 0:
+            QMessageBox.information(self, "Validation", "Sélectionnez une proposition.")
+            return
+        self.selected_correspondance_id = self.table.item(current_row, 0).data(Qt.UserRole)
+        super().accept()
+
+
 class QuickOuvrageCreateDialog(QDialog):
     def __init__(self, db_manager: DatabaseManager, section, parent=None):
         super().__init__(parent)
@@ -906,6 +967,9 @@ class ChiffrageTableDialog(QDialog):
 
         proposal_combo = QComboBox()
         proposal_combo.setObjectName(f"proposal_combo_{ouvrage['id']}")
+        proposal_combo.setMinimumContentsLength(45)
+        proposal_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        proposal_combo.view().setMinimumWidth(900)
         proposals = self.correspondance_service.correspondances_pour_ouvrage(ouvrage["section_id"]) if ouvrage.get("section_id") else []
         proposal_combo.addItem("Aucune proposition", None)
         for proposal in proposals:
@@ -2981,27 +3045,11 @@ class ProjetsPage(QWidget):
         if not propositions:
             QMessageBox.information(self, "Validation", "Aucune proposition à valider pour cette ligne.")
             return
-        labels = []
-        ids_by_label = {}
-        for proposition in propositions:
-            label = (
-                f"{float(proposition['score']):.1f} | {proposition['code'] or ''} | "
-                f"{proposition['designation'] or ''} | {proposition['bibliotheque_nom'] or ''}"
-            )
-            labels.append(label)
-            ids_by_label[label] = proposition["id"]
-        selected, ok = QInputDialog.getItem(
-            self,
-            "Valider une proposition",
-            "Proposition à valider :",
-            labels,
-            0,
-            False,
-        )
-        if not ok or selected not in ids_by_label:
+        dialog = ProposalSelectionDialog(propositions, self)
+        if dialog.exec() != QDialog.Accepted or not dialog.selected_correspondance_id:
             return
         try:
-            self.correspondance_service.associer_resultat_pour_ouvrage(section_id, ids_by_label[selected])
+            self.correspondance_service.associer_resultat_pour_ouvrage(section_id, dialog.selected_correspondance_id)
             self.chiffrage_service.copier_depuis_bibliotheque(section_id)
             self.refresh_section_table()
         except Exception as exc:
