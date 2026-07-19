@@ -206,6 +206,7 @@ class CorrespondanceService:
         self,
         projet_id: int,
         rechercher_toutes_bibliotheques: bool = False,
+        bibliotheque_id: Optional[int] = None,
         progress_callback=None,
         should_cancel=None,
         model=None,
@@ -220,6 +221,11 @@ class CorrespondanceService:
         embedding_model = model or self._get_embedding_model()
         score_minimum = self.score_minimum()
         candidates_all = self._catalogue_candidates()
+        if bibliotheque_id is not None:
+            candidates_all = [
+                candidate for candidate in candidates_all
+                if candidate["bibliotheque_id"] == bibliotheque_id
+            ]
         candidate_texts = [
             f"{candidate['designation'] or ''} {candidate['famille'] or ''}".strip()
             for candidate in candidates_all
@@ -232,7 +238,11 @@ class CorrespondanceService:
         )
         candidate_embeddings = embedding_model.encode(candidate_texts) if candidate_texts else []
         candidates_with_embeddings = list(zip(candidates_all, candidate_embeddings))
-        active_project_ids = None if rechercher_toutes_bibliotheques else self._active_project_library_ids(projet_id)
+        if bibliotheque_id is not None:
+            active_project_ids = {bibliotheque_id}
+            rechercher_toutes_bibliotheques = False
+        else:
+            active_project_ids = None if rechercher_toutes_bibliotheques else self._active_project_library_ids(projet_id)
         with self.db.get_connection() as conn:
             try:
                 for section in sections:

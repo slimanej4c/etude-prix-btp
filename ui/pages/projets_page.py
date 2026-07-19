@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QProgressBar,
+    QProgressDialog,
     QPushButton,
     QRadioButton,
     QScrollArea,
@@ -37,7 +38,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
 )
 from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot
-from PySide6.QtGui import QColor, QPainter
+from PySide6.QtGui import QBrush, QColor, QFont, QPainter
 
 from database.db_manager import DatabaseManager
 from repositories.projet_repository import ProjetRepository
@@ -120,13 +121,22 @@ class MatchingWorker(QObject):
     erreur = Signal(str)
     termine = Signal()
 
-    def __init__(self, db_path, migrations_dir, projet_id: int, elargir_toutes_bibliotheques: bool = False, mode: str = "textuel"):
+    def __init__(
+        self,
+        db_path,
+        migrations_dir,
+        projet_id: int,
+        elargir_toutes_bibliotheques: bool = False,
+        mode: str = "textuel",
+        bibliotheque_id: int | None = None,
+    ):
         super().__init__()
         self.db_path = db_path
         self.migrations_dir = migrations_dir
         self.projet_id = projet_id
         self.elargir_toutes_bibliotheques = elargir_toutes_bibliotheques
         self.mode = mode
+        self.bibliotheque_id = bibliotheque_id
         self._cancel_requested = False
 
     @Slot()
@@ -151,9 +161,15 @@ class MatchingWorker(QObject):
                 )
 
             if self.mode == "ia":
+                self.progression.emit(
+                    0,
+                    0,
+                    "Chargement du modèle IA. Si c'est la première utilisation, le téléchargement peut prendre quelques minutes...",
+                )
                 result = service.lancer_recherche_ia_projet(
                     self.projet_id,
                     rechercher_toutes_bibliotheques=self.elargir_toutes_bibliotheques,
+                    bibliotheque_id=self.bibliotheque_id,
                     progress_callback=on_progress,
                     should_cancel=lambda: self._cancel_requested,
                 )
@@ -372,6 +388,55 @@ class ProposalSelectionDialog(QDialog):
             QMessageBox.information(self, "Validation", "Sélectionnez une proposition.")
             return
         self.selected_correspondance_id = self.table.item(current_row, 0).data(Qt.UserRole)
+        super().accept()
+
+
+class AiLibraryScopeDialog(QDialog):
+    def __init__(self, db_manager: DatabaseManager, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Recherche auto avec IA")
+        self.setStyleSheet(APP_STYLESHEET)
+        self.selected_scope = None
+        self.bibliotheques = [b for b in BibliothequeRepository(db_manager).get_all() if b.actif]
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Où rechercher les correspondances IA ?"))
+
+        self.scope_group = QButtonGroup(self)
+        self.scope_group.setExclusive(True)
+        self.active_radio = QRadioButton("Bibliothèques actives du projet")
+        self.all_radio = QRadioButton("Toutes les bibliothèques")
+        self.one_radio = QRadioButton("Choisir une bibliothèque")
+        self.active_radio.setChecked(True)
+        self.scope_group.addButton(self.active_radio)
+        self.scope_group.addButton(self.all_radio)
+        self.scope_group.addButton(self.one_radio)
+        layout.addWidget(self.active_radio)
+        layout.addWidget(self.all_radio)
+        layout.addWidget(self.one_radio)
+
+        self.bibliotheque_combo = QComboBox()
+        for bibliotheque in self.bibliotheques:
+            self.bibliotheque_combo.addItem(bibliotheque.nom, bibliotheque.id)
+        self.bibliotheque_combo.setEnabled(False)
+        self.one_radio.toggled.connect(self.bibliotheque_combo.setEnabled)
+        layout.addWidget(self.bibliotheque_combo)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def accept(self):
+        if self.one_radio.isChecked():
+            if self.bibliotheque_combo.currentData() is None:
+                QMessageBox.warning(self, "Bibliothèque requise", "Sélectionnez une bibliothèque.")
+                return
+            self.selected_scope = (False, self.bibliotheque_combo.currentData())
+        elif self.all_radio.isChecked():
+            self.selected_scope = (True, None)
+        else:
+            self.selected_scope = (False, None)
         super().accept()
 
 
@@ -673,6 +738,8 @@ class ChiffrageTableDialog(QDialog):
         self.group_rows = {}
         self.ai_matching_thread = None
         self.ai_matching_worker = None
+        self.ai_progress_dialog = None
+        self.ai_matching_failed = False
         self._updating = False
         self.viewing_version_id = None
         self.columns = list(self.COLUMNS)
@@ -727,6 +794,7 @@ class ChiffrageTableDialog(QDialog):
         self.refresh_version_controls()
 
         self.dashboard_box = self._create_dashboard()
+        self.refresh_quick_compare_controls()
 
         self.table = QTableWidget()
         self.table.setColumnCount(len(self.columns))
@@ -752,8 +820,17 @@ class ChiffrageTableDialog(QDialog):
 
     def _create_dashboard(self):
         box = QGroupBox("Tableau de bord - Pendant le chiffrage")
-        box.setMaximumHeight(245)
-        layout = QHBoxLayout(box)
+        box.setMaximumHeight(285)
+        outer_layout = QVBoxLayout(box)
+        outer_layout.setContentsMargins(8, 8, 8, 8)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setFrameShape(QFrame.NoFrame)
+        content = QWidget()
+        layout = QHBoxLayout(content)
+        layout.setContentsMargins(0, 0, 0, 0)
 
         totals_panel = QWidget()
         totals_grid = QGridLayout(totals_panel)
@@ -791,9 +868,39 @@ class ChiffrageTableDialog(QDialog):
         self.group_totals_tree.setMaximumWidth(520)
         self.group_totals_tree.setMaximumHeight(185)
 
+        quick_compare = QGroupBox("Comparaison rapide")
+        quick_compare.setMinimumWidth(320)
+        quick_layout = QGridLayout(quick_compare)
+        self.quick_ref_combo = QComboBox()
+        self.quick_cmp_combo = QComboBox()
+        self.quick_ref_combo.currentIndexChanged.connect(self.update_quick_comparison)
+        self.quick_cmp_combo.currentIndexChanged.connect(self.update_quick_comparison)
+        self.quick_compare_labels = {}
+        quick_metrics = [
+            ("pv_ref", "PV référence"),
+            ("pv_cmp", "PV comparée"),
+            ("pv_diff", "Écart PV"),
+            ("margin_ref", "Marge référence"),
+            ("margin_cmp", "Marge comparée"),
+            ("margin_diff", "Écart marge"),
+        ]
+        quick_layout.addWidget(QLabel("Référence"), 0, 0)
+        quick_layout.addWidget(self.quick_ref_combo, 0, 1)
+        quick_layout.addWidget(QLabel("Comparer"), 1, 0)
+        quick_layout.addWidget(self.quick_cmp_combo, 1, 1)
+        for index, (key, label) in enumerate(quick_metrics, start=2):
+            value = QLabel("0.00 €")
+            value.setStyleSheet("font-weight: bold;")
+            quick_layout.addWidget(QLabel(label), index, 0)
+            quick_layout.addWidget(value, index, 1)
+            self.quick_compare_labels[key] = value
+
         layout.addWidget(totals_panel, 2)
         layout.addWidget(self.nature_table, 3)
         layout.addWidget(self.group_totals_tree, 3)
+        layout.addWidget(quick_compare, 2)
+        scroll.setWidget(content)
+        outer_layout.addWidget(scroll)
         return box
 
     def reload(self):
@@ -812,6 +919,27 @@ class ChiffrageTableDialog(QDialog):
             label = version.nom + (" (courante)" if version.est_version_courante else "")
             self.version_combo.addItem(label, version.id)
         self.version_combo.blockSignals(False)
+        self.refresh_quick_compare_controls()
+
+    def refresh_quick_compare_controls(self):
+        if not hasattr(self, "quick_ref_combo"):
+            return
+        versions = self.version_service.lister_versions(self.projet.id)
+        items = [("Original", SOURCE_ACTUEL)] + [(version.nom, str(version.id)) for version in versions]
+        for combo in (self.quick_ref_combo, self.quick_cmp_combo):
+            combo.blockSignals(True)
+            current = combo.currentData()
+            combo.clear()
+            for label, data in items:
+                combo.addItem(label, data)
+            preferred = current if current in [data for _label, data in items] else SOURCE_ACTUEL
+            combo.setCurrentIndex(max(combo.findData(preferred), 0))
+            combo.blockSignals(False)
+        self.quick_ref_combo.setCurrentIndex(max(self.quick_ref_combo.findData(SOURCE_ACTUEL), 0))
+        if versions:
+            latest_index = self.quick_cmp_combo.findData(str(versions[0].id))
+            self.quick_cmp_combo.setCurrentIndex(latest_index if latest_index >= 0 else 0)
+        self.update_quick_comparison()
 
     def show_original_work(self):
         self.reload()
@@ -847,6 +975,9 @@ class ChiffrageTableDialog(QDialog):
                     "ds_total": version_line["ds_total"],
                     "pv_unitaire": version_line["pv_unitaire"],
                     "pv_total": version_line["pv_total"],
+                    "mapping_status": version_line.get("statut_mapping") or "Aucune",
+                    "mapping_correspondance_id": version_line.get("correspondance_dpgf_id"),
+                    "mapping_ouvrage_bibliotheque_id": version_line.get("ouvrage_bibliotheque_id"),
                 }
             self.rows.append(row)
         self.populate_table()
@@ -898,31 +1029,51 @@ class ChiffrageTableDialog(QDialog):
             if lot_key != current_lot:
                 current_lot = lot_key
                 current_sous_lot = None
-                self._add_group_row("lot", lot_key, f"Lot - {ouvrage['lot_code']} {ouvrage['lot_libelle']}")
+                self._add_group_row("lot", lot_key, self._group_label(ouvrage["lot_code"], ouvrage["lot_libelle"]))
             if sous_lot_key != current_sous_lot:
                 current_sous_lot = sous_lot_key
-                self._add_group_row("sous_lot", sous_lot_key, f"Sous-lot - {ouvrage['sous_lot_code']} {ouvrage['sous_lot_libelle']}")
+                self._add_group_row("sous_lot", sous_lot_key, self._group_label(ouvrage["sous_lot_code"], ouvrage["sous_lot_libelle"]))
             self._add_ouvrage_row(ouvrage)
-        self._add_group_row("projet", self.projet.id, "Total projet")
+        self._add_group_row("projet", self.projet.id, "Total")
         self.recalculate_totals()
         self.update_mapping_progress()
         self._updating = False
         self._focus_requested_section()
 
+    def _group_label(self, code, libelle):
+        code = (code or "").strip()
+        libelle = (libelle or "").strip()
+        if code and libelle and code != libelle:
+            return f"{code} {libelle}"
+        return code or libelle
+
     def _add_group_row(self, group_type, group_id, label):
         row = self.table.rowCount()
         self.table.insertRow(row)
         self.group_rows[(group_type, group_id)] = row
-        item = QTableWidgetItem(f"- {label}")
+        prefix = {
+            "lot": "Lot",
+            "sous_lot": "Sous-lot",
+            "projet": "Projet",
+        }.get(group_type, "Groupe")
+        item = QTableWidgetItem(f"- {prefix} : {label}")
         item.setData(Qt.UserRole, {"row_type": group_type, "id": group_id, "collapsed": False})
         item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
         item.setBackground(QColor(COLORS["surface_alt"]))
+        item.setForeground(QBrush(QColor(COLORS["text"])))
+        font = item.font()
+        font.setBold(True)
+        item.setFont(font)
         self.table.setItem(row, 0, item)
         for col in range(1, len(self.columns)):
             empty = QTableWidgetItem("")
             empty.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             empty.setBackground(QColor(COLORS["surface_alt"]))
+            empty.setForeground(QBrush(QColor(COLORS["muted"])))
+            empty.setFont(QFont(font))
             self.table.setItem(row, col, empty)
+        self.table.setSpan(row, 0, 1, 9)
+        self.table.setRowHeight(row, 34 if group_type in {"lot", "projet"} else 30)
 
     def _add_ouvrage_row(self, ouvrage):
         row = self.table.rowCount()
@@ -955,7 +1106,7 @@ class ChiffrageTableDialog(QDialog):
             self._add_mapping_cells(row, ouvrage)
 
     def _add_mapping_cells(self, row, ouvrage):
-        status = self.correspondance_service.statut_ouvrage(ouvrage["section_id"]) if ouvrage.get("section_id") else "Aucune"
+        status = self._mapping_status_for_row(ouvrage)
         status_item = QTableWidgetItem(status)
         status_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
         status_item.setBackground(QColor({
@@ -975,7 +1126,7 @@ class ChiffrageTableDialog(QDialog):
         for proposal in proposals:
             label = f"{float(proposal['score']):.1f} | {proposal['code'] or ''} | {proposal['designation'] or ''} | {proposal['bibliotheque_nom'] or ''}"
             proposal_combo.addItem(label, proposal["id"])
-            if proposal["statut"] == "validee":
+            if self._mapping_correspondance_id_for_row(ouvrage) == proposal["id"]:
                 proposal_combo.setCurrentIndex(proposal_combo.count() - 1)
         proposal_combo.setProperty("previous_data", proposal_combo.currentData())
         proposal_combo.currentIndexChanged.connect(
@@ -998,6 +1149,22 @@ class ChiffrageTableDialog(QDialog):
         actions.setEnabled(self.viewing_version_id is None)
         self.table.setCellWidget(row, self.mapping_col_actions, actions)
 
+    def _mapping_status_for_row(self, ouvrage):
+        if self.viewing_version_id is not None:
+            return ouvrage.get("mapping_status") or "Aucune"
+        return self.correspondance_service.statut_ouvrage(ouvrage["section_id"]) if ouvrage.get("section_id") else "Aucune"
+
+    def _mapping_correspondance_id_for_row(self, ouvrage):
+        if self.viewing_version_id is not None:
+            return ouvrage.get("mapping_correspondance_id")
+        if not ouvrage.get("section_id"):
+            return None
+        validated = next(
+            (proposal for proposal in self.correspondance_service.correspondances_pour_ouvrage(ouvrage["section_id"]) if proposal["statut"] == "validee"),
+            None,
+        )
+        return validated["id"] if validated else None
+
     def on_mapping_proposal_combo_changed(self, ouvrage_id):
         if self._updating:
             return
@@ -1011,7 +1178,7 @@ class ChiffrageTableDialog(QDialog):
         current_data = combo.currentData()
         if current_data is not None:
             previous_data = combo.property("previous_data")
-            if previous_data == current_data and self.correspondance_service.statut_ouvrage(ouvrage["section_id"]) == "Validée":
+            if previous_data == current_data and self._mapping_status_for_row(ouvrage) == "Validée":
                 return
             reply = QMessageBox.question(
                 self,
@@ -1026,10 +1193,10 @@ class ChiffrageTableDialog(QDialog):
                 combo.blockSignals(False)
                 return
             try:
-                self.correspondance_service.associer_resultat_pour_ouvrage(ouvrage["section_id"], current_data)
                 if self.viewing_version_id is not None:
                     updated = self._copier_proposition_dans_version(ouvrage, current_data)
                 else:
+                    self.correspondance_service.associer_resultat_pour_ouvrage(ouvrage["section_id"], current_data)
                     updated = self.service.copier_depuis_bibliotheque(ouvrage["section_id"])
                 self._replace_row_data({**ouvrage, **updated})
                 self._refresh_ouvrage_row(row, {**ouvrage, **updated})
@@ -1039,7 +1206,7 @@ class ChiffrageTableDialog(QDialog):
                 QMessageBox.critical(self, "Erreur", f"Validation impossible :\n{exc}")
             return
 
-        was_validated = self.correspondance_service.statut_ouvrage(ouvrage["section_id"]) == "Validée"
+        was_validated = self._mapping_status_for_row(ouvrage) == "Validée"
         if was_validated:
             reply = QMessageBox.question(
                 self,
@@ -1055,7 +1222,6 @@ class ChiffrageTableDialog(QDialog):
                 combo.blockSignals(False)
                 return
         try:
-            self.correspondance_service.supprimer_correspondances_ouvrage(ouvrage["section_id"])
             if self.viewing_version_id is not None:
                 updated = self.version_service.sauvegarder_composants_ligne_version(
                     self.viewing_version_id,
@@ -1066,8 +1232,22 @@ class ChiffrageTableDialog(QDialog):
                     Decimal("0"),
                     Decimal("0"),
                 )
-                updated = {"id": ouvrage_id, **updated}
+                self.version_service.sauvegarder_mapping_ligne_version(
+                    self.viewing_version_id,
+                    ouvrage_id,
+                    "Aucune",
+                    None,
+                    None,
+                )
+                updated = {
+                    "id": ouvrage_id,
+                    **updated,
+                    "mapping_status": "Aucune",
+                    "mapping_correspondance_id": None,
+                    "mapping_ouvrage_bibliotheque_id": None,
+                }
             else:
+                self.correspondance_service.supprimer_correspondances_ouvrage(ouvrage["section_id"])
                 updated = self.service.sauvegarder_composants_ouvrage(
                     ouvrage_id,
                     Decimal("0"),
@@ -1110,7 +1290,20 @@ class ChiffrageTableDialog(QDialog):
             "pv_total": pv_total,
         }
         updated = self.version_service.sauvegarder_ligne_version(self.viewing_version_id, ouvrage["id"], values)
-        return {"id": ouvrage["id"], **updated}
+        self.version_service.sauvegarder_mapping_ligne_version(
+            self.viewing_version_id,
+            ouvrage["id"],
+            "Validée",
+            correspondance_id,
+            proposition.get("ouvrage_bibliotheque_id"),
+        )
+        return {
+            "id": ouvrage["id"],
+            **updated,
+            "mapping_status": "Validée",
+            "mapping_correspondance_id": correspondance_id,
+            "mapping_ouvrage_bibliotheque_id": proposition.get("ouvrage_bibliotheque_id"),
+        }
 
     def on_item_double_clicked(self, item):
         meta = item.data(Qt.UserRole) or {}
@@ -1206,7 +1399,7 @@ class ChiffrageTableDialog(QDialog):
                 section_id = row.get("section_id")
                 if not section_id:
                     continue
-                status = self.correspondance_service.statut_ouvrage(section_id)
+                status = self._mapping_status_for_row(row)
                 if status == "Validée":
                     validated += 1
                     dashboard_rows.append(row)
@@ -1234,6 +1427,46 @@ class ChiffrageTableDialog(QDialog):
         self.dashboard_labels["untreated"].setText(str(untreated))
         self._update_nature_dashboard(ds_total, dashboard_rows)
         self._update_group_dashboard(dashboard_rows)
+        self.update_quick_comparison()
+
+    def update_quick_comparison(self, *_args):
+        if not hasattr(self, "quick_compare_labels"):
+            return
+        ref_source = self.quick_ref_combo.currentData() or SOURCE_ACTUEL
+        cmp_source = self.quick_cmp_combo.currentData() or SOURCE_ACTUEL
+        try:
+            ref = self._quick_compare_aggregate(ref_source)
+            cmp = self._quick_compare_aggregate(cmp_source)
+        except Exception:
+            for label in self.quick_compare_labels.values():
+                label.setText("n/a")
+            return
+
+        ref_margin = ref["pv_total"] - ref["ds_total"]
+        cmp_margin = cmp["pv_total"] - cmp["ds_total"]
+        pv_diff = cmp["pv_total"] - ref["pv_total"]
+        margin_diff = cmp_margin - ref_margin
+        self.quick_compare_labels["pv_ref"].setText(self.version_service.format_euro(ref["pv_total"]))
+        self.quick_compare_labels["pv_cmp"].setText(self.version_service.format_euro(cmp["pv_total"]))
+        self.quick_compare_labels["pv_diff"].setText(self.version_service.format_ecart(pv_diff, ref["pv_total"]))
+        self.quick_compare_labels["margin_ref"].setText(self._quick_margin_text(ref_margin, ref["pv_total"]))
+        self.quick_compare_labels["margin_cmp"].setText(self._quick_margin_text(cmp_margin, cmp["pv_total"]))
+        self.quick_compare_labels["margin_diff"].setText(self.version_service.format_ecart(margin_diff, ref_margin))
+        self.quick_compare_labels["pv_diff"].setStyleSheet(
+            f"font-weight: bold; color: {COLORS['success' if pv_diff < 0 else 'danger' if pv_diff > 0 else 'text']};"
+        )
+        self.quick_compare_labels["margin_diff"].setStyleSheet(
+            f"font-weight: bold; color: {COLORS['success' if margin_diff > 0 else 'danger' if margin_diff < 0 else 'text']};"
+        )
+
+    def _quick_compare_aggregate(self, source):
+        if source == SOURCE_ACTUEL:
+            return self.version_service.repository.agreger_actuel(self.projet.id)
+        return self.version_service.repository.agreger_version(int(source))
+
+    def _quick_margin_text(self, margin, pv_total):
+        percent = (margin / pv_total * Decimal("100")) if pv_total else Decimal("0")
+        return f"{self.version_service.format_euro(margin)} / {self._percent_text(percent).replace('.', ',')}"
 
     def _update_nature_dashboard(self, ds_total, dashboard_rows):
         components = [
@@ -1300,7 +1533,7 @@ class ChiffrageTableDialog(QDialog):
             section_id = row.get("section_id")
             if not section_id:
                 continue
-            status = self.correspondance_service.statut_ouvrage(section_id)
+            status = self._mapping_status_for_row(row)
             if status == "Validée" or (status == "Aucune" and self._has_manual_complete_chiffrage(row)):
                 treated += 1
         self.progress_label.setText(f"{treated}/{total} lignes reliées")
@@ -1396,13 +1629,29 @@ class ChiffrageTableDialog(QDialog):
         selected_version_id = self.viewing_version_id
         for ouvrage in self.rows:
             section_id = ouvrage.get("section_id")
-            if section_id and self.correspondance_service.statut_ouvrage(section_id) != "Validée":
+            if section_id and self._mapping_status_for_row(ouvrage) != "Validée":
                 self.correspondance_service.rechercher(section_id, enregistrer=True)
+        if selected_version_id is not None:
+            self._sync_version_proposals_for_missing(selected_version_id)
         if selected_version_id is not None:
             self.show_saved_version(selected_version_id)
         else:
             self.rows = self.service.lister_ouvrages_projet(self.projet.id)
             self.populate_table()
+
+    def _sync_version_proposals_for_missing(self, version_id):
+        for ouvrage in self.rows:
+            section_id = ouvrage.get("section_id")
+            if not section_id or self._mapping_status_for_row(ouvrage) == "Validée":
+                continue
+            if self.correspondance_service.correspondances_pour_ouvrage(section_id):
+                self.version_service.sauvegarder_mapping_ligne_version(
+                    version_id,
+                    ouvrage["id"],
+                    "Proposée",
+                    None,
+                    None,
+                )
 
     def search_ai_for_all_missing(self):
         if not self.mapping_enabled:
@@ -1412,15 +1661,23 @@ class ChiffrageTableDialog(QDialog):
         scope = self._ask_ai_scope()
         if scope is None:
             return
+        elargir, bibliotheque_id = self._normalize_ai_scope(scope)
+        self.ai_matching_failed = False
         self.progress_label.setText("Recherche IA en cours...")
         self.btn_auto_search_ai.setEnabled(False)
+        self._show_ai_progress_dialog(
+            "Chargement du modèle IA. Si c'est la première utilisation, le téléchargement peut prendre quelques minutes...",
+            0,
+            0,
+        )
         self.ai_matching_thread = QThread(self)
         self.ai_matching_worker = MatchingWorker(
             self.db_manager.db_path,
             self.db_manager.migrations_dir,
             self.projet.id,
-            scope,
+            elargir,
             "ia",
+            bibliotheque_id,
         )
         self.ai_matching_worker.moveToThread(self.ai_matching_thread)
         self.ai_matching_thread.started.connect(self.ai_matching_worker.run)
@@ -1434,23 +1691,20 @@ class ChiffrageTableDialog(QDialog):
         self.ai_matching_thread.start()
 
     def _ask_ai_scope(self):
-        box = QMessageBox(self)
-        box.setWindowTitle("Recherche auto avec IA")
-        box.setText("Où rechercher les correspondances IA ?")
-        active_button = box.addButton("Bibliothèques actives du projet", QMessageBox.AcceptRole)
-        all_button = box.addButton("Toutes les bibliothèques", QMessageBox.DestructiveRole)
-        box.addButton("Annuler", QMessageBox.RejectRole)
-        box.exec()
-        clicked = box.clickedButton()
-        if clicked == active_button:
-            return False
-        if clicked == all_button:
-            return True
-        return None
+        dialog = AiLibraryScopeDialog(self.db_manager, self)
+        if dialog.exec() != QDialog.Accepted:
+            return None
+        return dialog.selected_scope
+
+    def _normalize_ai_scope(self, scope):
+        if isinstance(scope, tuple):
+            return scope
+        return bool(scope), None
 
     @Slot(int, int, str)
     def on_ai_matching_progress(self, current, total, message):
         self.progress_label.setText(f"IA : {message}")
+        self._update_ai_progress_dialog(message, current, total)
 
     @Slot(object)
     def on_ai_matching_success(self, result):
@@ -1462,21 +1716,69 @@ class ChiffrageTableDialog(QDialog):
         )
         selected_version_id = self.viewing_version_id
         if selected_version_id is not None:
+            self._sync_version_proposals_for_missing(selected_version_id)
             self.show_saved_version(selected_version_id)
         else:
             self.rows = self.service.lister_ouvrages_projet(self.projet.id)
             self.populate_table()
+        self._close_ai_progress_dialog()
 
     @Slot(str)
     def on_ai_matching_error(self, message):
+        self.ai_matching_failed = True
+        self.progress_label.setText("IA : erreur")
+        self._show_ai_error(message)
         QMessageBox.critical(self, "Recherche IA impossible", message)
 
     @Slot()
     def on_ai_matching_finished(self):
         self.btn_auto_search_ai.setEnabled(True)
-        self.progress_label.setText("")
+        if not self.ai_matching_failed:
+            self.progress_label.setText("")
         self.ai_matching_worker = None
         self.ai_matching_thread = None
+
+    def _show_ai_progress_dialog(self, message, current, total):
+        if self.ai_progress_dialog is None:
+            self.ai_progress_dialog = QProgressDialog(message, "Annuler", 0, 0, self)
+            self.ai_progress_dialog.setWindowTitle("Recherche auto avec IA")
+            self.ai_progress_dialog.setMinimumDuration(0)
+            self.ai_progress_dialog.setAutoClose(False)
+            self.ai_progress_dialog.setAutoReset(False)
+            self.ai_progress_dialog.canceled.connect(self.cancel_ai_matching)
+        self._update_ai_progress_dialog(message, current, total)
+        self.ai_progress_dialog.show()
+
+    def _update_ai_progress_dialog(self, message, current, total):
+        if self.ai_progress_dialog is None:
+            return
+        if total <= 0:
+            self.ai_progress_dialog.setRange(0, 0)
+            self.ai_progress_dialog.setValue(0)
+        else:
+            self.ai_progress_dialog.setRange(0, total)
+            self.ai_progress_dialog.setValue(min(current, total))
+        self.ai_progress_dialog.setLabelText(message)
+
+    def _show_ai_error(self, message):
+        if self.ai_progress_dialog is None:
+            self._show_ai_progress_dialog(f"Erreur : {message}", 1, 1)
+            return
+        self.ai_progress_dialog.setRange(0, 1)
+        self.ai_progress_dialog.setValue(1)
+        self.ai_progress_dialog.setLabelText(f"Erreur : {message}")
+        self.ai_progress_dialog.setCancelButtonText("Fermer")
+        self.ai_progress_dialog.show()
+
+    def _close_ai_progress_dialog(self):
+        if self.ai_progress_dialog is not None:
+            self.ai_progress_dialog.close()
+            self.ai_progress_dialog = None
+
+    def cancel_ai_matching(self):
+        if self.ai_matching_worker:
+            self.progress_label.setText("IA : annulation demandée...")
+            self.ai_matching_worker.cancel()
 
     def _refresh_mapping_cells(self, row, ouvrage):
         if self.mapping_enabled and row is not None:
@@ -1855,24 +2157,21 @@ class MappingPageDialog(QDialog):
         scope = self._ask_ai_scope()
         if scope is None:
             return
-        self._start_matching_worker(scope, "ia")
+        elargir, bibliotheque_id = self._normalize_ai_scope(scope)
+        self._start_matching_worker(elargir, "ia", bibliotheque_id)
 
     def _ask_ai_scope(self):
-        box = QMessageBox(self)
-        box.setWindowTitle("Recherche auto avec IA")
-        box.setText("Où rechercher les correspondances IA ?")
-        active_button = box.addButton("Bibliothèques actives du projet", QMessageBox.AcceptRole)
-        all_button = box.addButton("Toutes les bibliothèques", QMessageBox.DestructiveRole)
-        box.addButton("Annuler", QMessageBox.RejectRole)
-        box.exec()
-        clicked = box.clickedButton()
-        if clicked == active_button:
-            return False
-        if clicked == all_button:
-            return True
-        return None
+        dialog = AiLibraryScopeDialog(self.service.db, self)
+        if dialog.exec() != QDialog.Accepted:
+            return None
+        return dialog.selected_scope
 
-    def _start_matching_worker(self, elargir, mode):
+    def _normalize_ai_scope(self, scope):
+        if isinstance(scope, tuple):
+            return scope
+        return bool(scope), None
+
+    def _start_matching_worker(self, elargir, mode, bibliotheque_id=None):
         estimate = self.service.estimer_rapprochement(self.projet.id, elargir)
         seuil = self.matching_comparison_threshold()
         if mode != "ia" and estimate["comparaisons_estimees"] > seuil:
@@ -1904,6 +2203,7 @@ class MappingPageDialog(QDialog):
             self.projet.id,
             elargir,
             mode,
+            bibliotheque_id,
         )
         self.matching_worker.moveToThread(self.matching_thread)
         self.matching_thread.started.connect(self.matching_worker.run)
@@ -1934,8 +2234,12 @@ class MappingPageDialog(QDialog):
 
     @Slot(int, int, str)
     def on_matching_progress(self, current, total, message):
-        self.matching_progress.setMaximum(max(total, 1))
-        self.matching_progress.setValue(current)
+        if total <= 0:
+            self.matching_progress.setRange(0, 0)
+            self.matching_progress.setValue(0)
+        else:
+            self.matching_progress.setRange(0, total)
+            self.matching_progress.setValue(current)
         self.matching_status.setText(message)
 
     @Slot(object)
@@ -2278,14 +2582,8 @@ class ProjetsPage(QWidget):
         self.btn_open.clicked.connect(self.on_open_project)
         self.btn_import = QPushButton("Importer DPGF")
         self.btn_import.clicked.connect(self.on_import_dpgf)
-        self.btn_mapping = QPushButton("Mapping")
+        self.btn_mapping = QPushButton("Mapping et chiffrage")
         self.btn_mapping.clicked.connect(self.on_open_mapping)
-        self.btn_chiffrage = QPushButton("Chiffrage")
-        self.btn_chiffrage.clicked.connect(self.on_open_chiffrage)
-        self.btn_create_version = QPushButton("Créer une version")
-        self.btn_create_version.clicked.connect(self.on_create_version)
-        self.btn_compare_versions = QPushButton("Comparaison de versions")
-        self.btn_compare_versions.clicked.connect(self.on_compare_versions)
 
         header_layout.addWidget(titre)
         header_layout.addWidget(self.search_input, 1)
@@ -2295,9 +2593,6 @@ class ProjetsPage(QWidget):
         header_layout.addWidget(self.btn_open)
         header_layout.addWidget(self.btn_import)
         header_layout.addWidget(self.btn_mapping)
-        header_layout.addWidget(self.btn_chiffrage)
-        header_layout.addWidget(self.btn_create_version)
-        header_layout.addWidget(self.btn_compare_versions)
 
         splitter = QSplitter(Qt.Vertical)
         projects_panel = QWidget()
@@ -2312,27 +2607,7 @@ class ProjetsPage(QWidget):
         self.projects_table.itemSelectionChanged.connect(self.on_project_selection_changed)
         self.projects_table.itemDoubleClicked.connect(self.on_open_project)
 
-        versions_header = QHBoxLayout()
-        versions_title = QLabel("Versions du projet")
-        versions_title.setStyleSheet("font-weight: bold;")
-        self.btn_delete_version = QPushButton("Supprimer la version")
-        self.btn_delete_version.clicked.connect(self.on_delete_version)
-        versions_header.addWidget(versions_title)
-        versions_header.addStretch()
-        versions_header.addWidget(self.btn_delete_version)
-
-        self.versions_table = QTableWidget()
-        self.versions_table.setColumnCount(5)
-        self.versions_table.setHorizontalHeaderLabels(["ID", "Nom", "Date", "Lignes", "Action"])
-        self.versions_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        self.versions_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.versions_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.versions_table.itemDoubleClicked.connect(self.on_compare_versions)
-        self.versions_table.itemSelectionChanged.connect(self.update_project_buttons)
-
         projects_panel_layout.addWidget(self.projects_table)
-        projects_panel_layout.addLayout(versions_header)
-        projects_panel_layout.addWidget(self.versions_table)
 
         dpgf_splitter = QSplitter(Qt.Horizontal)
         dpgf_right = QWidget()

@@ -286,6 +286,28 @@ def test_recherche_ia_ajoute_propositions_sans_validation(db, service, sample_da
     assert service.statut_ouvrage(sample_data["ouvrage_id"]) == "Proposée"
 
 
+def test_recherche_ia_limitee_a_une_bibliotheque(db, service, sample_data):
+    class FakeModel:
+        def encode(self, texts):
+            return [[1.0, 0.0, 0.0] for _text in texts]
+
+    set_score_min(db, 1)
+
+    result = service.lancer_recherche_ia_projet(
+        sample_data["projet_id"],
+        bibliotheque_id=sample_data["cloison_biblio"],
+        model=FakeModel(),
+    )
+
+    assert result.propositions > 0
+    correspondances = (
+        service.correspondances_pour_ouvrage(sample_data["ouvrage_id"])
+        + service.correspondances_pour_ouvrage(sample_data["autre_ouvrage_id"])
+    )
+    assert correspondances
+    assert {corr["bibliotheque_nom"] for corr in correspondances} == {"Cloisons"}
+
+
 def test_refus_suppression_ouvrage_bibliotheque_reference(service, sample_data):
     service.associer_manuellement(sample_data["ouvrage_id"], sample_data["cloison_ouvrage"])
     with pytest.raises(Exception):

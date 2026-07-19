@@ -33,14 +33,30 @@ class VersionProjetRepository:
                     """
                     INSERT INTO versions_projet_lignes (
                         version_id, ouvrage_projet_id, ds_mo, ds_mat, ds_materiel,
-                        ds_transport, ds_st, ds_total, pv_unitaire, pv_total
+                        ds_transport, ds_st, ds_total, pv_unitaire, pv_total,
+                        correspondance_dpgf_id, ouvrage_bibliotheque_id, statut_mapping
                     )
                     SELECT
                         ?, op.id, op.ds_mo, op.ds_mat, op.ds_materiel,
-                        op.ds_transport, op.ds_st, op.ds_total, op.pv_unitaire, op.pv_total
+                        op.ds_transport, op.ds_st, op.ds_total, op.pv_unitaire, op.pv_total,
+                        validee.id,
+                        validee.ouvrage_bibliotheque_id,
+                        CASE
+                            WHEN validee.id IS NOT NULL THEN 'Validée'
+                            WHEN EXISTS (
+                                SELECT 1
+                                FROM correspondances_dpgf proposee
+                                WHERE proposee.ouvrage_projet_id = op.section_projet_id
+                                  AND proposee.statut = 'proposee'
+                            ) THEN 'Proposée'
+                            ELSE 'Aucune'
+                        END
                     FROM ouvrages_projet op
                     JOIN sous_lots sl ON sl.id = op.sous_lot_id
                     JOIN lots l ON l.id = sl.lot_id
+                    LEFT JOIN correspondances_dpgf validee
+                        ON validee.ouvrage_projet_id = op.section_projet_id
+                       AND validee.statut = 'validee'
                     WHERE l.projet_id = ?
                     ORDER BY l.ordre_affichage, sl.ordre_affichage, op.ordre_affichage, op.id
                     """,
@@ -80,11 +96,13 @@ class VersionProjetRepository:
                     """
                     INSERT INTO versions_projet_lignes (
                         version_id, ouvrage_projet_id, ds_mo, ds_mat, ds_materiel,
-                        ds_transport, ds_st, ds_total, pv_unitaire, pv_total
+                        ds_transport, ds_st, ds_total, pv_unitaire, pv_total,
+                        correspondance_dpgf_id, ouvrage_bibliotheque_id, statut_mapping
                     )
                     SELECT
                         ?, ouvrage_projet_id, ds_mo, ds_mat, ds_materiel,
-                        ds_transport, ds_st, ds_total, pv_unitaire, pv_total
+                        ds_transport, ds_st, ds_total, pv_unitaire, pv_total,
+                        correspondance_dpgf_id, ouvrage_bibliotheque_id, statut_mapping
                     FROM versions_projet_lignes
                     WHERE version_id = ?
                     """,
@@ -145,7 +163,10 @@ class VersionProjetRepository:
         derniere = self.lignes_version(version["id"])
         if set(actuel) != set(derniere):
             return True
-        keys = ("ds_mo", "ds_mat", "ds_materiel", "ds_transport", "ds_st", "ds_total", "pv_unitaire", "pv_total")
+        keys = (
+            "ds_mo", "ds_mat", "ds_materiel", "ds_transport", "ds_st", "ds_total", "pv_unitaire", "pv_total",
+            "correspondance_dpgf_id", "ouvrage_bibliotheque_id", "statut_mapping",
+        )
         for ouvrage_id, ligne_actuelle in actuel.items():
             ligne_version = derniere[ouvrage_id]
             if any(ligne_actuelle[key] != ligne_version[key] for key in keys):
@@ -259,6 +280,73 @@ class VersionProjetRepository:
                 "pv_unitaire": self._money(values["pv_unitaire"]),
                 "pv_total": self._money(values["pv_total"]),
             }
+
+    def sauvegarder_mapping_ligne_version(
+        self,
+        version_id: int,
+        ouvrage_projet_id: int,
+        statut_mapping: str,
+        correspondance_dpgf_id: Optional[int] = None,
+        ouvrage_bibliotheque_id: Optional[int] = None,
+    ) -> None:
+        if statut_mapping not in {"Aucune", "Proposée", "Validée"}:
+            raise ValueError("Statut mapping de version invalide.")
+        with self.db.get_connection() as conn:
+            exists = conn.execute(
+                """
+                SELECT id
+                FROM versions_projet_lignes
+                WHERE version_id = ? AND ouvrage_projet_id = ?
+                """,
+                (version_id, ouvrage_projet_id),
+            ).fetchone()
+            if not exists:
+                source = conn.execute(
+                    """
+                    SELECT op.ds_mo, op.ds_mat, op.ds_materiel, op.ds_transport, op.ds_st,
+                           op.ds_total, op.pv_unitaire, op.pv_total
+                    FROM versions_projet v
+                    JOIN ouvrages_projet op ON op.id = ?
+                    JOIN sous_lots sl ON sl.id = op.sous_lot_id
+                    JOIN lots l ON l.id = sl.lot_id AND l.projet_id = v.projet_id
+                    WHERE v.id = ?
+                    """,
+                    (ouvrage_projet_id, version_id),
+                ).fetchone()
+                if not source:
+                    raise ValueError("Ligne de version introuvable.")
+                conn.execute(
+                    """
+                    INSERT INTO versions_projet_lignes (
+                        version_id, ouvrage_projet_id, ds_mo, ds_mat, ds_materiel,
+                        ds_transport, ds_st, ds_total, pv_unitaire, pv_total
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        version_id,
+                        ouvrage_projet_id,
+                        source["ds_mo"],
+                        source["ds_mat"],
+                        source["ds_materiel"],
+                        source["ds_transport"],
+                        source["ds_st"],
+                        source["ds_total"],
+                        source["pv_unitaire"],
+                        source["pv_total"],
+                    ),
+                )
+            conn.execute(
+                """
+                UPDATE versions_projet_lignes
+                SET statut_mapping = ?,
+                    correspondance_dpgf_id = ?,
+                    ouvrage_bibliotheque_id = ?
+                WHERE version_id = ? AND ouvrage_projet_id = ?
+                """,
+                (statut_mapping, correspondance_dpgf_id, ouvrage_bibliotheque_id, version_id, ouvrage_projet_id),
+            )
+            conn.commit()
 
     def _upsert_ligne_version_conn(self, conn, version_id: int, ouvrage_projet_id: int, values: Dict[str, Decimal]) -> None:
         updated = conn.execute(
@@ -403,7 +491,8 @@ class VersionProjetRepository:
             SELECT
                 op.id AS ouvrage_projet_id, op.code, op.designation, l.libelle AS lot_libelle,
                 vl.ds_mo, vl.ds_mat, vl.ds_materiel, vl.ds_transport, vl.ds_st,
-                vl.ds_total, vl.pv_unitaire, vl.pv_total
+                vl.ds_total, vl.pv_unitaire, vl.pv_total,
+                vl.correspondance_dpgf_id, vl.ouvrage_bibliotheque_id, vl.statut_mapping
             FROM versions_projet_lignes vl
             JOIN ouvrages_projet op ON op.id = vl.ouvrage_projet_id
             JOIN sous_lots sl ON sl.id = op.sous_lot_id
@@ -423,10 +512,25 @@ class VersionProjetRepository:
             SELECT
                 op.id AS ouvrage_projet_id, op.code, op.designation, l.libelle AS lot_libelle,
                 op.ds_mo, op.ds_mat, op.ds_materiel, op.ds_transport, op.ds_st,
-                op.ds_total, op.pv_unitaire, op.pv_total
+                op.ds_total, op.pv_unitaire, op.pv_total,
+                validee.id AS correspondance_dpgf_id,
+                validee.ouvrage_bibliotheque_id,
+                CASE
+                    WHEN validee.id IS NOT NULL THEN 'Validée'
+                    WHEN EXISTS (
+                        SELECT 1
+                        FROM correspondances_dpgf proposee
+                        WHERE proposee.ouvrage_projet_id = op.section_projet_id
+                          AND proposee.statut = 'proposee'
+                    ) THEN 'Proposée'
+                    ELSE 'Aucune'
+                END AS statut_mapping
             FROM ouvrages_projet op
             JOIN sous_lots sl ON sl.id = op.sous_lot_id
             JOIN lots l ON l.id = sl.lot_id
+            LEFT JOIN correspondances_dpgf validee
+                ON validee.ouvrage_projet_id = op.section_projet_id
+               AND validee.statut = 'validee'
             WHERE l.projet_id = ?
         """
         params = [projet_id]

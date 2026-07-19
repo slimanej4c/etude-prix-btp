@@ -8,7 +8,7 @@ import pytest
 from openpyxl import Workbook
 from PySide6.QtCore import QEventLoop, QItemSelectionModel, QThread, QTimer, Qt
 from PySide6.QtGui import QColor
-from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QPushButton, QHeaderView, QRadioButton
+from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QPushButton, QHeaderView, QProgressDialog, QRadioButton, QScrollArea
 
 from database.db_manager import DatabaseManager
 from models.entites import Bibliotheque, OuvrageBibliotheque, Projet, SectionProjet
@@ -32,6 +32,7 @@ from ui.pages.projets_page import (
     DpgfImportWorker,
     MappingPageDialog,
     MatchingWorker,
+    AiLibraryScopeDialog,
     ProposalSelectionDialog,
     ProjetsPage,
     QuickOuvrageCreateDialog,
@@ -593,6 +594,75 @@ def test_tableau_bord_chiffrage_temps_reel(qapp, temp_db_manager, projet_id):
     assert dialog.nature_table.item(0, 1).text() == "60.00 €"
 
 
+def test_tableau_bord_comparaison_rapide_original_derniere_version(qapp, temp_db_manager, projet_id):
+    projet, _sections, service, ids = build_mapping_fixture(temp_db_manager, projet_id)
+    chiffrage = ChiffrageProjetService(
+        temp_db_manager,
+        SectionProjetRepository(temp_db_manager),
+        CorrespondanceDpgfRepository(temp_db_manager),
+    )
+    version_service = VersionProjetService(VersionProjetRepository(temp_db_manager))
+    service.associer_resultat_pour_ouvrage(ids["section_a"], ids["corr_a"])
+    chiffrage.copier_depuis_bibliotheque(ids["section_a"])
+    dialog = ChiffrageTableDialog(
+        projet,
+        chiffrage,
+        correspondance_service=service,
+        db_manager=temp_db_manager,
+        version_service=version_service,
+    )
+    version_id = version_service.creer_version(projet_id, "Version 1")
+    dialog.refresh_version_controls()
+
+    ouvrage = next(row for row in dialog.rows if row["section_id"] == ids["section_a"])
+    row = dialog.row_by_ouvrage_id[ouvrage["id"]]
+    dialog.table.item(row, 4).setText("60")
+
+    assert dialog.dashboard_box.findChild(QScrollArea) is not None
+    assert dialog.quick_ref_combo.currentData() == SOURCE_ACTUEL
+    assert dialog.quick_cmp_combo.currentData() == str(version_id)
+    assert dialog.quick_compare_labels["pv_ref"].text() == "105,00 €"
+    assert dialog.quick_compare_labels["pv_cmp"].text() == "75,00 €"
+    assert "-30,00 €" in dialog.quick_compare_labels["pv_diff"].text()
+    assert dialog.quick_compare_labels["margin_ref"].text() == "35,00 € / 33,33 %"
+    assert dialog.quick_compare_labels["margin_cmp"].text() == "25,00 € / 33,33 %"
+
+
+def test_table_mapping_chiffrage_lignes_groupes_distinctes_et_totaux(qapp, temp_db_manager, projet_id):
+    projet, _sections, service, ids = build_mapping_fixture(temp_db_manager, projet_id)
+    chiffrage = ChiffrageProjetService(
+        temp_db_manager,
+        SectionProjetRepository(temp_db_manager),
+        CorrespondanceDpgfRepository(temp_db_manager),
+    )
+    service.associer_resultat_pour_ouvrage(ids["section_a"], ids["corr_a"])
+    chiffrage.copier_depuis_bibliotheque(ids["section_a"])
+    dialog = ChiffrageTableDialog(
+        projet,
+        chiffrage,
+        correspondance_service=service,
+        db_manager=temp_db_manager,
+    )
+
+    lot_row = dialog.group_rows[("lot", dialog.rows[0]["lot_id"])]
+    sous_lot_row = dialog.group_rows[("sous_lot", dialog.rows[0]["sous_lot_id"])]
+    ouvrage_row = dialog.row_by_ouvrage_id[dialog.rows[0]["id"]]
+
+    for group_row, expected_prefix in ((lot_row, "- Lot :"), (sous_lot_row, "- Sous-lot :")):
+        meta = dialog.table.item(group_row, 0).data(Qt.UserRole)
+        assert meta["row_type"] in {"lot", "sous_lot"}
+        assert dialog.table.item(group_row, 0).text().startswith(expected_prefix)
+        assert dialog.table.columnSpan(group_row, 0) == 9
+        assert not (dialog.table.item(group_row, 4).flags() & Qt.ItemIsEditable)
+        assert not (dialog.table.item(group_row, 5).flags() & Qt.ItemIsEditable)
+
+    expected_ds = sum(row["ds_total"] for row in dialog.rows if row["sous_lot_id"] == dialog.rows[0]["sous_lot_id"])
+    expected_pv = sum(row["pv_total"] for row in dialog.rows if row["sous_lot_id"] == dialog.rows[0]["sous_lot_id"])
+    assert dialog.table.item(sous_lot_row, 9).text() == dialog._money_text(expected_ds)
+    assert dialog.table.item(sous_lot_row, 12).text() == dialog._money_text(expected_pv)
+    assert dialog.table.item(ouvrage_row, 4).flags() & Qt.ItemIsEditable
+
+
 def test_table_mapping_chiffrage_designation_redimensionnable(qapp, temp_db_manager, projet_id):
     projet, _sections, service, _ids = build_mapping_fixture(temp_db_manager, projet_id)
     chiffrage = ChiffrageProjetService(
@@ -729,7 +799,6 @@ def test_page_mapping_chiffrage_version_change_proposition_et_dashboard(qapp, te
     version_service = VersionProjetService(VersionProjetRepository(temp_db_manager))
     service.associer_resultat_pour_ouvrage(ids["section_a"], ids["corr_a"])
     chiffrage.copier_depuis_bibliotheque(ids["section_a"])
-    version_id = version_service.creer_version(projet_id, "Version 1")
     dialog = ChiffrageTableDialog(
         projet,
         chiffrage,
@@ -737,6 +806,7 @@ def test_page_mapping_chiffrage_version_change_proposition_et_dashboard(qapp, te
         db_manager=temp_db_manager,
         version_service=version_service,
     )
+    version_id = version_service.creer_version(projet_id, "Version 1")
     dialog.refresh_version_controls()
     dialog.version_combo.setCurrentIndex(dialog.version_combo.findData(version_id))
     ouvrage_b = next(row for row in dialog.rows if row["section_id"] == ids["section_b"])
@@ -754,7 +824,7 @@ def test_page_mapping_chiffrage_version_change_proposition_et_dashboard(qapp, te
     monkeypatch.setattr("ui.pages.projets_page.QMessageBox.critical", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError(args[2])))
     combo.setCurrentIndex(combo.findData(ids["corr_b"]))
 
-    assert service.statut_ouvrage(ids["section_b"]) == "Validée"
+    assert service.statut_ouvrage(ids["section_b"]) == "Proposée"
     assert dialog.table.item(row_b, dialog.mapping_col_status).text() == "Validée"
     assert dialog.table.item(row_b, dialog.mapping_col_status).background().color() == QColor(COLORS["success"])
     assert dialog.dashboard_labels["ds_total"].text() == "150.00 €"
@@ -766,6 +836,69 @@ def test_page_mapping_chiffrage_version_change_proposition_et_dashboard(qapp, te
     rows = {row["cle"]: row for row in current["lignes"]}
     assert rows["ds_total"]["reference"] == Decimal("150.00")
     assert rows["ds_total"]["comparee"] == Decimal("50.00")
+    version_line = version_service.repository.lignes_version(version_id)[ouvrage_b["id"]]
+    assert version_line["statut_mapping"] == "Validée"
+    assert version_line["correspondance_dpgf_id"] == ids["corr_b"]
+
+
+def test_versions_figent_les_correspondances_validees(qapp, temp_db_manager, projet_id, monkeypatch):
+    projet, _sections, service, ids = build_mapping_fixture(temp_db_manager, projet_id)
+    chiffrage = ChiffrageProjetService(
+        temp_db_manager,
+        SectionProjetRepository(temp_db_manager),
+        CorrespondanceDpgfRepository(temp_db_manager),
+    )
+    version_service = VersionProjetService(VersionProjetRepository(temp_db_manager))
+    monkeypatch.setattr(ChiffrageTableDialog, "prompt_original_version_creation", lambda self: None)
+    service.associer_resultat_pour_ouvrage(ids["section_a"], ids["corr_a"])
+    chiffrage.copier_depuis_bibliotheque(ids["section_a"])
+    setup_dialog = ChiffrageTableDialog(
+        projet,
+        chiffrage,
+        correspondance_service=service,
+        db_manager=temp_db_manager,
+        version_service=version_service,
+    )
+    version_1 = version_service.creer_version(projet_id, "Version 1")
+
+    service.associer_resultat_pour_ouvrage(ids["section_b"], ids["corr_b"])
+    chiffrage.copier_depuis_bibliotheque(ids["section_b"])
+    setup_dialog.reload()
+    version_2 = version_service.creer_version(projet_id, "Version 2")
+
+    dialog = ChiffrageTableDialog(
+        projet,
+        chiffrage,
+        correspondance_service=service,
+        db_manager=temp_db_manager,
+        version_service=version_service,
+    )
+    dialog.refresh_version_controls()
+    ouvrage_a = next(row for row in dialog.rows if row["section_id"] == ids["section_a"])
+    ouvrage_b = next(row for row in dialog.rows if row["section_id"] == ids["section_b"])
+
+    dialog.version_combo.setCurrentIndex(dialog.version_combo.findData(version_1))
+    row_a = dialog.row_by_ouvrage_id[ouvrage_a["id"]]
+    row_b = dialog.row_by_ouvrage_id[ouvrage_b["id"]]
+    assert dialog.table.item(row_a, dialog.mapping_col_status).text() == "Validée"
+    assert dialog.table.item(row_b, dialog.mapping_col_status).text() == "Proposée"
+    assert dialog.dashboard_labels["validated"].text() == "1"
+    assert dialog.dashboard_labels["proposed"].text() == "1"
+
+    dialog.version_combo.setCurrentIndex(dialog.version_combo.findData(version_2))
+    row_a = dialog.row_by_ouvrage_id[ouvrage_a["id"]]
+    row_b = dialog.row_by_ouvrage_id[ouvrage_b["id"]]
+    assert dialog.table.item(row_a, dialog.mapping_col_status).text() == "Validée"
+    assert dialog.table.item(row_b, dialog.mapping_col_status).text() == "Validée"
+    assert dialog.dashboard_labels["validated"].text() == "2"
+    assert dialog.dashboard_labels["proposed"].text() == "0"
+
+    version_1_lines = version_service.repository.lignes_version(version_1)
+    version_2_lines = version_service.repository.lignes_version(version_2)
+    assert version_1_lines[ouvrage_a["id"]]["statut_mapping"] == "Validée"
+    assert version_1_lines[ouvrage_b["id"]]["statut_mapping"] == "Proposée"
+    assert version_2_lines[ouvrage_a["id"]]["statut_mapping"] == "Validée"
+    assert version_2_lines[ouvrage_b["id"]]["statut_mapping"] == "Validée"
 
 
 def test_page_mapping_chiffrage_auto_mapping_version_garde_validees(qapp, temp_db_manager, projet_id):
@@ -1212,6 +1345,97 @@ def test_matching_worker_progression_et_fin(qapp, temp_db_manager, projet_id):
     assert result["success"].total >= 2
     assert result["progress"]
     assert result["finished"] == 1
+
+
+def test_matching_worker_ia_signale_chargement_modele_avant_erreur(qapp, temp_db_manager, projet_id, monkeypatch):
+    build_mapping_fixture(temp_db_manager, projet_id)
+    messages = []
+
+    def fake_ia(*args, **kwargs):
+        raise RuntimeError("Erreur IA simulée")
+
+    monkeypatch.setattr(CorrespondanceService, "lancer_recherche_ia_projet", fake_ia)
+    worker = MatchingWorker(temp_db_manager.db_path, temp_db_manager.migrations_dir, projet_id, False, "ia")
+    worker.progression.connect(lambda current, total, message: messages.append((current, total, message)))
+
+    worker.run()
+
+    assert messages
+    assert messages[0][0] == 0
+    assert messages[0][1] == 0
+    assert "Chargement du modèle IA" in messages[0][2]
+
+
+def test_page_mapping_chiffrage_progression_ia_dialog(qapp, temp_db_manager, projet_id, monkeypatch):
+    projet, _sections, service, _ids = build_mapping_fixture(temp_db_manager, projet_id)
+    chiffrage = ChiffrageProjetService(
+        temp_db_manager,
+        SectionProjetRepository(temp_db_manager),
+        CorrespondanceDpgfRepository(temp_db_manager),
+    )
+    dialog = ChiffrageTableDialog(
+        projet,
+        chiffrage,
+        correspondance_service=service,
+        db_manager=temp_db_manager,
+    )
+
+    dialog._show_ai_progress_dialog("Chargement du modèle IA", 0, 0)
+    progress_dialog = dialog.findChild(QProgressDialog)
+
+    assert progress_dialog is not None
+    assert progress_dialog.maximum() == 0
+    assert "Chargement du modèle IA" in progress_dialog.labelText()
+
+    dialog.on_ai_matching_progress(3, 10, "3/10 lignes traitées")
+
+    assert progress_dialog.maximum() == 10
+    assert progress_dialog.value() == 3
+    assert "3/10" in progress_dialog.labelText()
+
+    monkeypatch.setattr("ui.pages.projets_page.QMessageBox.critical", lambda *args, **kwargs: None)
+    dialog.on_ai_matching_error("Erreur réseau")
+
+    assert "Erreur réseau" in progress_dialog.labelText()
+    assert dialog.progress_label.text() == "IA : erreur"
+
+
+def test_choix_recherche_ia_permet_une_bibliotheque_precise(qapp, temp_db_manager, projet_id):
+    build_mapping_fixture(temp_db_manager, projet_id)
+    dialog = AiLibraryScopeDialog(temp_db_manager)
+
+    assert dialog.active_radio.isChecked()
+    assert dialog.bibliotheque_combo.count() >= 1
+
+    dialog.one_radio.setChecked(True)
+    assert dialog.bibliotheque_combo.isEnabled()
+    dialog.accept()
+
+    assert dialog.selected_scope == (False, dialog.bibliotheque_combo.currentData())
+
+
+def test_page_mapping_chiffrage_passe_bibliotheque_choisie_au_worker(qapp, temp_db_manager, projet_id, monkeypatch):
+    projet, _sections, service, _ids = build_mapping_fixture(temp_db_manager, projet_id)
+    chiffrage = ChiffrageProjetService(
+        temp_db_manager,
+        SectionProjetRepository(temp_db_manager),
+        CorrespondanceDpgfRepository(temp_db_manager),
+    )
+    biblio_id = BibliothequeRepository(temp_db_manager).get_all()[0].id
+    dialog = ChiffrageTableDialog(
+        projet,
+        chiffrage,
+        correspondance_service=service,
+        db_manager=temp_db_manager,
+    )
+    monkeypatch.setattr(dialog, "_ask_ai_scope", lambda: (False, biblio_id))
+    monkeypatch.setattr(dialog, "_show_ai_progress_dialog", lambda *args, **kwargs: None)
+    monkeypatch.setattr("ui.pages.projets_page.QThread.start", lambda self: None)
+
+    dialog.search_ai_for_all_missing()
+
+    assert dialog.ai_matching_worker.bibliotheque_id == biblio_id
+    assert dialog.ai_matching_worker.elargir_toutes_bibliotheques is False
 
 
 def test_mapping_validation_ligne_par_ligne(qapp, temp_db_manager, projet_id):

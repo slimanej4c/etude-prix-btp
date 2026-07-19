@@ -65,6 +65,22 @@ class VersionProjetService:
     def sauvegarder_ligne_version(self, version_id: int, ouvrage_projet_id: int, values: Dict[str, Decimal]) -> Dict:
         return self.repository.sauvegarder_ligne_version(version_id, ouvrage_projet_id, values)
 
+    def sauvegarder_mapping_ligne_version(
+        self,
+        version_id: int,
+        ouvrage_projet_id: int,
+        statut_mapping: str,
+        correspondance_dpgf_id: Optional[int] = None,
+        ouvrage_bibliotheque_id: Optional[int] = None,
+    ) -> None:
+        self.repository.sauvegarder_mapping_ligne_version(
+            version_id,
+            ouvrage_projet_id,
+            statut_mapping,
+            correspondance_dpgf_id,
+            ouvrage_bibliotheque_id,
+        )
+
     def lister_lots(self, projet_id: int) -> List[Dict]:
         return self.repository.lister_lots(projet_id)
 
